@@ -43,6 +43,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strconv"
 	"net/http"
 	"os"
 	"sort"
@@ -331,20 +332,100 @@ func main() {
 	}
 }
 
+func getenv(key, def string) string {
+    if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+        return v
+    }
+    return def
+}
+
+func getenvInt(key string, def int) int {
+    if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+        if n, err := strconv.Atoi(v); err == nil {
+            return n
+        }
+    }
+    return def
+}
+
+func getenvBool(key string, def bool) bool {
+    if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+        if b, err := strconv.ParseBool(v); err == nil {
+            return b
+        }
+    }
+    return def
+}
+
 func loadConfig(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var cfg Config
-	if err := json.Unmarshal(data, &cfg); err != nil {
+	cfg := Config{}
+
+	if data, err := os.ReadFile(path); err == nil {
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			return nil, err
+		}
+	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
 
 	cfg.RelayName = strings.TrimSpace(cfg.RelayName)
 	cfg.RegistryURL = strings.TrimSpace(cfg.RegistryURL)
 	cfg.Region = strings.TrimSpace(cfg.Region)
+	cfg.RelayName = getenv("RELAY_NAME", cfg.RelayName)
 
+	cfg.PublicPort = getenvInt("PUBLIC_PORT", cfg.PublicPort)
+	
+	cfg.PublicURL = getenv("PUBLIC_URL", cfg.PublicURL)
+	
+	cfg.UseCloudflare = getenvBool(
+		"USE_CLOUDFLARE",
+		cfg.UseCloudflare,
+	)
+	
+	cfg.RegistryURL = getenv(
+		"REGISTRY_URL",
+		cfg.RegistryURL,
+	)
+	
+	cfg.Region = getenv(
+		"REGION",
+		cfg.Region,
+	)
+	
+	cfg.MaxRooms = getenvInt(
+		"MAX_ROOMS",
+		cfg.MaxRooms,
+	)
+	
+	cfg.MaxUsers = getenvInt(
+		"MAX_USERS",
+		cfg.MaxUsers,
+	)
+	
+	cfg.RoomMaxUsers = getenvInt(
+		"ROOM_MAX_USERS",
+		cfg.RoomMaxUsers,
+	)
+	
+	cfg.AllowNewRooms = getenvBool(
+		"ALLOW_NEW_ROOMS",
+		cfg.AllowNewRooms,
+	)
+	
+	cfg.HeartbeatSeconds = getenvInt(
+		"HEARTBEAT_SECONDS",
+		cfg.HeartbeatSeconds,
+	)
+	
+	cfg.RoomTTLSeconds = getenvInt(
+		"ROOM_TTL_SECONDS",
+		cfg.RoomTTLSeconds,
+	)
+	
+	cfg.MessageTTLSeconds = getenvInt(
+		"MESSAGE_TTL_SECONDS",
+		cfg.MessageTTLSeconds,
+	)
 	if cfg.Region == "" {
 		cfg.Region = "other"
 	}
