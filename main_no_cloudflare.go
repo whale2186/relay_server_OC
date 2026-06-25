@@ -258,7 +258,7 @@ func main() {
 		srv.relayName = "Relay"
 	}
 	if srv.publicPort <= 0 {
-    srv.publicPort = 9000
+    srv.publicPort = 80
 	}
 	if strings.TrimSpace(srv.region) == "" {
 		srv.region = "other"
