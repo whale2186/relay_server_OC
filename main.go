@@ -268,6 +268,22 @@ type wsEnvelope struct {
 	Users                  []Member          `json:"users,omitempty"`
 }
 
+type messageHistoryResponse struct {
+	RoomID   string                     `json:"roomId"`
+	Messages []persistedMessageResponse `json:"messages"`
+	HasMore  bool                       `json:"hasMore"`
+}
+
+type persistedMessageResponse struct {
+	MessageID      string            `json:"messageId"`
+	RoomID         string            `json:"roomId"`
+	SenderID       string            `json:"senderId"`
+	Text           string            `json:"text"`
+	CreatedAt      int64             `json:"createdAt"`
+	UpdatedAt      int64             `json:"updatedAt"`
+	DeliveryStatus map[string]string `json:"deliveryStatus,omitempty"`
+}
+
 type registryRegisterResponse struct {
 	RelayID string `json:"relayId"`
 }
@@ -360,6 +376,49 @@ func (s *mongoMessageStore) SaveMessage(ctx context.Context, msg *Message) error
 		options.UpdateOne().SetUpsert(true),
 	)
 	return err
+}
+
+func (s *mongoMessageStore) RoomMessages(ctx context.Context, roomID string, before int64, limit int) ([]*Message, bool, error) {
+	if s == nil {
+		return nil, false, errors.New("message store is not configured")
+	}
+	if limit <= 0 {
+		limit = defaultSyncLimit
+	}
+	if limit > defaultSyncLimit {
+		limit = defaultSyncLimit
+	}
+	now := time.Now().UTC().Unix()
+	filter := bson.M{
+		"roomId":    roomID,
+		"expiresAt": bson.M{"$gt": now},
+	}
+	if before > 0 {
+		filter["createdAt"] = bson.M{"$lt": before}
+	}
+	cursor, err := s.collection.Find(ctx, filter, options.Find().
+		SetSort(bson.D{{"createdAt", -1}, {"messageId", -1}}).
+		SetLimit(int64(limit+1)),
+	)
+	if err != nil {
+		return nil, false, err
+	}
+	defer cursor.Close(ctx)
+
+	var stored []storedMessage
+	if err := cursor.All(ctx, &stored); err != nil {
+		return nil, false, err
+	}
+	hasMore := len(stored) > limit
+	if hasMore {
+		stored = stored[:limit]
+	}
+	out := make([]*Message, 0, len(stored))
+	for i := len(stored) - 1; i >= 0; i-- {
+		msg := storedToMessage(stored[i])
+		out = append(out, &msg)
+	}
+	return out, hasMore, nil
 }
 
 func (s *mongoMessageStore) MissedMessages(ctx context.Context, roomID, userID string, limit int) ([]*Message, error) {
@@ -835,10 +894,22 @@ func (s *RelayServer) handleRooms(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *RelayServer) handleRoomByID(w http.ResponseWriter, r *http.Request) {
-	roomID := strings.TrimPrefix(r.URL.Path, "/api/rooms/")
-	roomID = strings.TrimSpace(roomID)
-	if roomID == "" || strings.Contains(roomID, "/") {
+	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/rooms/"), "/")
+	parts := strings.Split(path, "/")
+	roomID := ""
+	if len(parts) > 0 {
+		roomID = strings.TrimSpace(parts[0])
+	}
+	if roomID == "" {
 		writeJSONError(w, http.StatusBadRequest, "room_id_required")
+		return
+	}
+	if len(parts) == 2 && parts[1] == "messages" {
+		s.handleRoomMessages(w, r, roomID)
+		return
+	}
+	if len(parts) != 1 {
+		writeJSONError(w, http.StatusNotFound, "route_not_found")
 		return
 	}
 
@@ -856,6 +927,71 @@ func (s *RelayServer) handleRoomByID(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 	}
+}
+
+func (s *RelayServer) handleRoomMessages(w http.ResponseWriter, r *http.Request, roomID string) {
+	if r.Method != http.MethodGet {
+		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed")
+		return
+	}
+	room, ok := s.getRoom(roomID)
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "room_not_found")
+		return
+	}
+	snap := room.snapshot()
+	if !snap.OfflineMessagesEnabled {
+		writeJSON(w, http.StatusOK, messageHistoryResponse{RoomID: roomID, Messages: []persistedMessageResponse{}, HasMore: false})
+		return
+	}
+	if s.messageStore == nil {
+		writeJSONError(w, http.StatusServiceUnavailable, "offline_message_store_unavailable")
+		return
+	}
+
+	before := int64(0)
+	if raw := strings.TrimSpace(r.URL.Query().Get("before")); raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || parsed < 0 {
+			writeJSONError(w, http.StatusBadRequest, "invalid_before")
+			return
+		}
+		before = parsed
+	}
+	limit := defaultSyncLimit
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err != nil || parsed <= 0 {
+			writeJSONError(w, http.StatusBadRequest, "invalid_limit")
+			return
+		}
+		limit = parsed
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	messages, hasMore, err := s.messageStore.RoomMessages(ctx, roomID, before, limit)
+	cancel()
+	if err != nil {
+		log.Printf("list room messages failed: room=%s error=%v", roomID, err)
+		writeJSONError(w, http.StatusInternalServerError, "message_history_failed")
+		return
+	}
+	out := make([]persistedMessageResponse, 0, len(messages))
+	for _, msg := range messages {
+		if msg == nil {
+			continue
+		}
+		out = append(out, persistedMessageResponse{
+			MessageID:      msg.MessageID,
+			RoomID:         msg.RoomID,
+			SenderID:       msg.SenderID,
+			Text:           msg.Text,
+			CreatedAt:      msg.CreatedAt,
+			UpdatedAt:      msg.UpdatedAt,
+			DeliveryStatus: cloneDeliveryStatus(msg.DeliveryStatus),
+		})
+	}
+	writeJSON(w, http.StatusOK, messageHistoryResponse{RoomID: roomID, Messages: out, HasMore: hasMore})
 }
 
 func (s *RelayServer) handleInternalRoomRegister(w http.ResponseWriter, r *http.Request) {
