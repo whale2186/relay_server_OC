@@ -378,7 +378,7 @@ func (s *mongoMessageStore) SaveMessage(ctx context.Context, msg *Message) error
 	return err
 }
 
-func (s *mongoMessageStore) RoomMessages(ctx context.Context, roomID string, before int64, limit int) ([]*Message, bool, error) {
+func (s *mongoMessageStore) RoomMessages(ctx context.Context, roomID string, before int64, after int64, afterID string, limit int) ([]*Message, bool, error) {
 	if s == nil {
 		return nil, false, errors.New("message store is not configured")
 	}
@@ -393,11 +393,24 @@ func (s *mongoMessageStore) RoomMessages(ctx context.Context, roomID string, bef
 		"roomId":    roomID,
 		"expiresAt": bson.M{"$gt": now},
 	}
+	sortOrder := bson.D{{"createdAt", -1}, {"messageId", -1}}
+	reverseResults := true
 	if before > 0 {
 		filter["createdAt"] = bson.M{"$lt": before}
+	} else if after > 0 {
+		if afterID != "" {
+			filter["$or"] = bson.A{
+				bson.M{"createdAt": bson.M{"$gt": after}},
+				bson.M{"createdAt": after, "messageId": bson.M{"$gt": afterID}},
+			}
+		} else {
+			filter["createdAt"] = bson.M{"$gt": after}
+		}
+		sortOrder = bson.D{{"createdAt", 1}, {"messageId", 1}}
+		reverseResults = false
 	}
 	cursor, err := s.collection.Find(ctx, filter, options.Find().
-		SetSort(bson.D{{"createdAt", -1}, {"messageId", -1}}).
+		SetSort(sortOrder).
 		SetLimit(int64(limit+1)),
 	)
 	if err != nil {
@@ -414,9 +427,16 @@ func (s *mongoMessageStore) RoomMessages(ctx context.Context, roomID string, bef
 		stored = stored[:limit]
 	}
 	out := make([]*Message, 0, len(stored))
-	for i := len(stored) - 1; i >= 0; i-- {
-		msg := storedToMessage(stored[i])
-		out = append(out, &msg)
+	if reverseResults {
+		for i := len(stored) - 1; i >= 0; i-- {
+			msg := storedToMessage(stored[i])
+			out = append(out, &msg)
+		}
+	} else {
+		for i := range stored {
+			msg := storedToMessage(stored[i])
+			out = append(out, &msg)
+		}
 	}
 	return out, hasMore, nil
 }
@@ -955,6 +975,20 @@ func (s *RelayServer) handleRoomMessages(w http.ResponseWriter, r *http.Request,
 		}
 		before = parsed
 	}
+	after := int64(0)
+	if raw := strings.TrimSpace(r.URL.Query().Get("after")); raw != "" {
+		parsed, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || parsed < 0 {
+			writeJSONError(w, http.StatusBadRequest, "invalid_after")
+			return
+		}
+		after = parsed
+	}
+	afterID := strings.TrimSpace(r.URL.Query().Get("afterId"))
+	if before > 0 && after > 0 {
+		writeJSONError(w, http.StatusBadRequest, "before_after_conflict")
+		return
+	}
 	limit := defaultSyncLimit
 	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
 		parsed, err := strconv.Atoi(raw)
@@ -966,7 +1000,7 @@ func (s *RelayServer) handleRoomMessages(w http.ResponseWriter, r *http.Request,
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	messages, hasMore, err := s.messageStore.RoomMessages(ctx, roomID, before, limit)
+	messages, hasMore, err := s.messageStore.RoomMessages(ctx, roomID, before, after, afterID, limit)
 	cancel()
 	if err != nil {
 		log.Printf("list room messages failed: room=%s error=%v", roomID, err)
