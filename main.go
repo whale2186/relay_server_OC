@@ -436,10 +436,7 @@ func (s *mongoMessageStore) MissedMessages(ctx context.Context, roomID, userID s
 		"deliveryStatus": bson.M{
 			"$elemMatch": bson.M{
 				"userId": userID,
-				"status": bson.M{"$in": []string{
-					messageStatusPending,
-					messageStatusSent,
-				}},
+				"status": messageStatusPending,
 			},
 		},
 	}
