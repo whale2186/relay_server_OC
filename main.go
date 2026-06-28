@@ -512,6 +512,14 @@ func (s *mongoMessageStore) MarkStatus(ctx context.Context, roomID, messageID, u
 	return &msg, nil
 }
 
+func (s *mongoMessageStore) DeleteMessage(ctx context.Context, roomID, messageID string) error {
+	if s == nil {
+		return nil
+	}
+	_, err := s.collection.DeleteOne(ctx, bson.M{"roomId": roomID, "messageId": messageID})
+	return err
+}
+
 func (s *mongoMessageStore) DeleteExpired(ctx context.Context, now int64) error {
 	if s == nil {
 		return nil
@@ -1461,6 +1469,13 @@ func (c *Client) handleAck(req ackRequest) {
 			return
 		}
 		stored = msg
+		if stored != nil && len(stored.PendingAcks) == 0 {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := c.srv.messageStore.DeleteMessage(ctx, roomID, messageID); err != nil {
+				log.Printf("delete delivered offline message failed: room=%s message=%s error=%v", roomID, messageID, err)
+			}
+			cancel()
+		}
 	}
 
 	updatedAt := time.Now().UTC().Unix()
