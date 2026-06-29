@@ -219,6 +219,11 @@ type messageRequest struct {
 	Text      string `json:"text,omitempty"`
 }
 
+type deleteMessageRequest struct {
+	Type      string `json:"type"`
+	MessageID string `json:"messageId"`
+}
+
 type ackRequest struct {
 	Type      string `json:"type"`
 	MessageID string `json:"messageId"`
@@ -265,6 +270,8 @@ type wsEnvelope struct {
 	UpdatedAt              int64             `json:"updatedAt,omitempty"`
 	Status                 string            `json:"status,omitempty"`
 	DeliveryStatus         map[string]string `json:"deliveryStatus,omitempty"`
+	DeletedBy              string            `json:"deletedBy,omitempty"`
+	ClearedBy              string            `json:"clearedBy,omitempty"`
 	OfflineMessagesEnabled bool              `json:"offlineMessagesEnabled,omitempty"`
 	Room                   *roomSnapshot     `json:"room,omitempty"`
 	Users                  []Member          `json:"users,omitempty"`
@@ -520,6 +527,28 @@ func (s *mongoMessageStore) DeleteMessage(ctx context.Context, roomID, messageID
 	}
 	_, err := s.collection.DeleteOne(ctx, bson.M{"roomId": roomID, "messageId": messageID})
 	return err
+}
+
+func (s *mongoMessageStore) DeleteMessageForSender(ctx context.Context, roomID, messageID, senderID string) (bool, error) {
+	if s == nil {
+		return false, nil
+	}
+	res, err := s.collection.DeleteOne(ctx, bson.M{"roomId": roomID, "messageId": messageID, "senderId": senderID})
+	if err != nil {
+		return false, err
+	}
+	return res.DeletedCount > 0, nil
+}
+
+func (s *mongoMessageStore) DeleteRoomMessages(ctx context.Context, roomID string) (int64, error) {
+	if s == nil {
+		return 0, nil
+	}
+	res, err := s.collection.DeleteMany(ctx, bson.M{"roomId": roomID})
+	if err != nil {
+		return 0, err
+	}
+	return res.DeletedCount, nil
 }
 
 func (s *mongoMessageStore) DeleteExpired(ctx context.Context, now int64) error {
@@ -957,6 +986,20 @@ func (s *RelayServer) handleRoomByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *RelayServer) handleRoomMessages(w http.ResponseWriter, r *http.Request, roomID string) {
+	if r.Method == http.MethodDelete {
+		ok, err := s.clearRoomMessages(roomID, "")
+		if err != nil {
+			log.Printf("clear room messages failed: room=%s error=%v", roomID, err)
+			writeJSONError(w, http.StatusInternalServerError, "message_clear_failed")
+			return
+		}
+		if !ok {
+			writeJSONError(w, http.StatusNotFound, "room_not_found")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "roomId": roomID})
+		return
+	}
 	if r.Method != http.MethodGet {
 		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed")
 		return
@@ -1138,6 +1181,15 @@ func (c *Client) readPump() {
 				continue
 			}
 			c.handleMessage(req)
+		case "delete_message":
+			var req deleteMessageRequest
+			if err := mapToStruct(raw, &req); err != nil {
+				c.writeError("invalid_delete_message_request")
+				continue
+			}
+			c.handleDeleteMessage(req)
+		case "clear_messages":
+			c.handleClearMessages()
 		case "ack":
 			var req ackRequest
 			if err := mapToStruct(raw, &req); err != nil {
@@ -1476,13 +1528,6 @@ func (c *Client) handleAck(req ackRequest) {
 			return
 		}
 		stored = msg
-		if stored != nil && len(stored.PendingAcks) == 0 {
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			if err := c.srv.messageStore.DeleteMessage(ctx, roomID, messageID); err != nil {
-				log.Printf("delete delivered offline message failed: room=%s message=%s error=%v", roomID, messageID, err)
-			}
-			cancel()
-		}
 	}
 
 	updatedAt := time.Now().UTC().Unix()
@@ -1551,6 +1596,82 @@ func (c *Client) handleAck(req ackRequest) {
 			DeliveryStatus: deliveryStatus,
 			UpdatedAt:      updatedAt,
 		})
+	}
+}
+
+func (c *Client) handleDeleteMessage(req deleteMessageRequest) {
+	if c.room == nil || c.UserID == "" {
+		c.writeError("join_room_first")
+		return
+	}
+	messageID := strings.TrimSpace(req.MessageID)
+	if messageID == "" {
+		c.writeError("message_id_required")
+		return
+	}
+
+	room := c.room
+	now := time.Now().UTC().Unix()
+
+	room.mu.Lock()
+	roomID := room.RoomID
+	offlineEnabled := room.OfflineMessagesEnabled
+	msg, found := room.Messages[messageID]
+	if found && msg.SenderID != c.UserID {
+		room.mu.Unlock()
+		c.writeError("message_delete_forbidden")
+		return
+	}
+	if found {
+		delete(room.Messages, messageID)
+		room.removeFromAllPostboxesLocked(messageID)
+		room.LastActivityAt = now
+		room.UpdatedAt = now
+	}
+	room.mu.Unlock()
+
+	deletedFromStore := false
+	if offlineEnabled && c.srv.messageStore != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		deleted, err := c.srv.messageStore.DeleteMessageForSender(ctx, roomID, messageID, c.UserID)
+		cancel()
+		if err != nil {
+			log.Printf("delete message from store failed: room=%s message=%s user=%s error=%v", roomID, messageID, c.UserID, err)
+			c.writeError("message_delete_failed")
+			return
+		}
+		deletedFromStore = deleted
+	}
+
+	if !found && !deletedFromStore {
+		c.writeError("message_not_found")
+		return
+	}
+
+	room.broadcastAll(wsEnvelope{
+		Type:      "message_deleted",
+		Ok:        true,
+		RoomID:    roomID,
+		MessageID: messageID,
+		SenderID:  c.UserID,
+		DeletedBy: c.UserID,
+		UpdatedAt: now,
+	})
+}
+
+func (c *Client) handleClearMessages() {
+	if c.room == nil || c.UserID == "" {
+		c.writeError("join_room_first")
+		return
+	}
+	ok, err := c.srv.clearRoomMessages(c.room.RoomID, c.UserID)
+	if err != nil {
+		log.Printf("clear messages from socket failed: room=%s user=%s error=%v", c.room.RoomID, c.UserID, err)
+		c.writeError("message_clear_failed")
+		return
+	}
+	if !ok {
+		c.writeError("room_not_found")
 	}
 }
 
@@ -1841,6 +1962,46 @@ func (s *RelayServer) deleteRoom(roomID string) {
 	for _, c := range clients {
 		c.forceClose()
 	}
+	if s.messageStore != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if _, err := s.messageStore.DeleteRoomMessages(ctx, roomID); err != nil {
+			log.Printf("delete room messages failed: room=%s error=%v", roomID, err)
+		}
+		cancel()
+	}
+}
+
+func (s *RelayServer) clearRoomMessages(roomID, clearedBy string) (bool, error) {
+	room, ok := s.getRoom(roomID)
+	if !ok {
+		return false, nil
+	}
+
+	now := time.Now().UTC().Unix()
+	room.mu.Lock()
+	room.Messages = make(map[string]*Message)
+	room.Postboxes = make(map[string][]*Message)
+	room.LastActivityAt = now
+	room.UpdatedAt = now
+	room.mu.Unlock()
+
+	if s.messageStore != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_, err := s.messageStore.DeleteRoomMessages(ctx, roomID)
+		cancel()
+		if err != nil {
+			return true, err
+		}
+	}
+
+	room.broadcastAll(wsEnvelope{
+		Type:      "messages_cleared",
+		Ok:        true,
+		RoomID:    roomID,
+		ClearedBy: clearedBy,
+		UpdatedAt: now,
+	})
+	return true, nil
 }
 
 func (room *Room) snapshot() roomSnapshot {
@@ -1913,6 +2074,20 @@ func (room *Room) broadcastExcept(exceptUserID string, evt wsEnvelope) {
 			continue
 		}
 		targets = append(targets, client)
+	}
+	room.mu.RUnlock()
+	for _, client := range targets {
+		client.sendJSON(evt)
+	}
+}
+
+func (room *Room) broadcastAll(evt wsEnvelope) {
+	room.mu.RLock()
+	targets := make([]*Client, 0, len(room.Clients))
+	for _, client := range room.Clients {
+		if client != nil {
+			targets = append(targets, client)
+		}
 	}
 	room.mu.RUnlock()
 	for _, client := range targets {
