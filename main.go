@@ -208,6 +208,7 @@ type joinRequest struct {
 	UserID    string          `json:"userId"`
 	Nickname  string          `json:"nickname,omitempty"`
 	Pin       string          `json:"pin,omitempty"`
+	PinHash   string          `json:"pinHash,omitempty"`
 	Transport string          `json:"transport,omitempty"`
 	PeerInfo  json.RawMessage `json:"peerInfo,omitempty"`
 }
@@ -229,6 +230,7 @@ type signalRequest struct {
 	TargetUserID string          `json:"targetUserId,omitempty"`
 	SignalType   string          `json:"signalType,omitempty"`
 	Data         json.RawMessage `json:"data,omitempty"`
+	Payload      json.RawMessage `json:"payload,omitempty"`
 }
 
 type roomSnapshot struct {
@@ -1205,12 +1207,16 @@ func (c *Client) handleJoin(req joinRequest) {
 	room.mu.Lock()
 
 	if room.PinHash != "" {
-		if req.Pin == "" {
+		providedPinHash := strings.TrimSpace(req.PinHash)
+		if providedPinHash == "" && req.Pin != "" {
+			providedPinHash = hashPin(req.Pin)
+		}
+		if providedPinHash == "" {
 			room.mu.Unlock()
 			c.writeError("pin_required")
 			return
 		}
-		if hashPin(req.Pin) != room.PinHash {
+		if !strings.EqualFold(providedPinHash, room.PinHash) {
 			room.mu.Unlock()
 			c.writeError("pin_invalid")
 			return
@@ -1281,8 +1287,9 @@ func (c *Client) handleLeave() {
 		return
 	}
 	room := c.room
-	room.removeClient(c.UserID)
-	room.broadcastExcept(c.UserID, wsEnvelope{Type: "user_left", RoomID: room.RoomID, UserID: c.UserID})
+	if room.removeClient(c.UserID, c) {
+		room.broadcastExcept(c.UserID, wsEnvelope{Type: "user_left", RoomID: room.RoomID, UserID: c.UserID})
+	}
 	c.room = nil
 	c.UserID = ""
 }
@@ -1564,6 +1571,10 @@ func (c *Client) handleSignal(req signalRequest) {
 		c.writeError("target_offline")
 		return
 	}
+	data := req.Data
+	if len(data) == 0 {
+		data = req.Payload
+	}
 	target.sendJSON(wsEnvelope{
 		Type:         "signal",
 		RoomID:       room.RoomID,
@@ -1571,7 +1582,7 @@ func (c *Client) handleSignal(req signalRequest) {
 		Nickname:     c.Nickname,
 		TargetUserID: req.TargetUserID,
 		SignalType:   req.SignalType,
-		Data:         req.Data,
+		Data:         data,
 	})
 }
 
@@ -1594,9 +1605,11 @@ func (c *Client) cleanup() {
 	c.once.Do(func() {
 		if c.room != nil && c.UserID != "" {
 			room := c.room
-			room.removeClient(c.UserID)
-			room.broadcastExcept(c.UserID, wsEnvelope{Type: "user_left", RoomID: room.RoomID, UserID: c.UserID})
-			if room.shouldDelete(c.srv.roomTTL) {
+			removed := room.removeClient(c.UserID, c)
+			if removed {
+				room.broadcastExcept(c.UserID, wsEnvelope{Type: "user_left", RoomID: room.RoomID, UserID: c.UserID})
+			}
+			if removed && room.shouldDelete(c.srv.roomTTL) {
 				c.srv.deleteRoom(room.RoomID)
 			}
 			c.room = nil
@@ -1867,9 +1880,15 @@ func (room *Room) connectedMembersSnapshot() []Member {
 	return out
 }
 
-func (room *Room) removeClient(userID string) {
+func (room *Room) removeClient(userID string, expected *Client) bool {
 	room.mu.Lock()
 	defer room.mu.Unlock()
+	if expected != nil {
+		current, ok := room.Clients[userID]
+		if !ok || current != expected {
+			return false
+		}
+	}
 	if member, ok := room.Members[userID]; ok {
 		member.Connected = false
 		member.LastSeenAt = time.Now().UTC().Unix()
@@ -1877,6 +1896,7 @@ func (room *Room) removeClient(userID string) {
 	delete(room.Clients, userID)
 	room.LastActivityAt = time.Now().UTC().Unix()
 	room.UpdatedAt = time.Now().UTC().Unix()
+	return true
 }
 
 func (room *Room) shouldDelete(roomTTL time.Duration) bool {
